@@ -1,0 +1,11 @@
+version: '3.8'
+services:
+  ros:
+    image: ros:jazzy
+    container_name: ros_jazzy
+    tty: true
+    stdin_open: true
+    volumes:
+      - ./:/workspace
+    working_dir: /workspace
+    command: bash
