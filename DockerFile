@@ -1,0 +1,6 @@
+FROM osrf/ros:jazzy-desktop-full
+
+RUN apt update && \
+  apt install -y qtwayland5
+
+CMD ["bash"]
