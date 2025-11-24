@@ -1,2 +1,7 @@
 .vscode/
 KITTI_data/
+
+# colcon parts
+build/
+install/
+log/
