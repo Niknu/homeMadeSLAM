@@ -1,7 +1,9 @@
 .vscode/
 KITTI_data/
+**/__pycache__/
 
 # colcon parts
 build/
 install/
 log/
+ 
