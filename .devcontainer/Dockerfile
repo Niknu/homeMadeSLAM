@@ -1,4 +1,4 @@
-FROM osrf/ros:jazzy-desktop-full
+FROM osrf/ros:lyrical-desktop-full
 
 RUN apt-get update && \
   apt-get install -y \
