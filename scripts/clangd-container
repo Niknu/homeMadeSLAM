@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Run clangd inside the ROS 2 devcontainer so it resolves /opt/ros/lyrical
+# headers, and translate host paths to container paths for the editor.
+#
+# Usage: same as clangd (nvim spawns this as the LSP cmd; see
+# ~/.config/nvim/lua/plugins/clangd-container.lua).
+set -euo pipefail
+
+HOST_ROOT="$HOME/git/homeMadeSLAM"
+CONTAINER_ROOT="/workspace"
+
+container="${CLANGD_CONTAINER:-}"
+if [ -z "$container" ]; then
+  # Match by compose labels: survives renames (ros_container vs ros_jazzy).
+  container="$(docker ps -a \
+    --filter "label=com.docker.compose.project=homemadeslam_devcontainer" \
+    --filter "label=com.docker.compose.service=ros" \
+    --format '{{.Names}}' | head -n1)"
+fi
+
+if [ -z "$container" ]; then
+  echo "clangd-container: devcontainer not found. Start it with:" >&2
+  echo "  docker compose -p homemadeslam_devcontainer -f $HOST_ROOT/.devcontainer/docker-compose.yml up -d" >&2
+  exit 1
+fi
+
+if [ "$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" != "true" ]; then
+  docker start "$container" >/dev/null
+fi
+
+exec docker exec -i "$container" clangd \
+  --path-mappings="$HOST_ROOT=$CONTAINER_ROOT" \
+  --query-driver=/usr/bin/c++ \
+  "$@"
