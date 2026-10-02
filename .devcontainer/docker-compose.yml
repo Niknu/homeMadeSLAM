@@ -1,0 +1,35 @@
+services:
+  ros:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    user: 1000:1000
+    container_name: ros_container
+    environment:
+      DISPLAY: ${DISPLAY}
+      WAYLAND_DISPLAY: wayland-1
+      QT_QPA_PLATFORM: wayland
+      ELECTRON_OZONE_PLATFORM_HINT: wayland
+      XDG_RUNTIME_DIR: /tmp/xdg
+    volumes:
+      - ../:/workspace
+      #wayland socket
+      - /run/user/1000/:/tmp/xdg
+      # xserver
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      # clangd background index, so it survives container recreation
+      - clangd-index:/home/ubuntu/.cache/clangd
+    working_dir: /workspace
+    tty: false
+    stdin_open: false
+    command: ["/bin/sh", "-c", "trap 'exit 0' TERM; trap '' HUP INT; while :; do sleep 3600 & wait $!; done"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [all]
+
+volumes:
+  clangd-index:
