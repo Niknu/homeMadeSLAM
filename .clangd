@@ -1,0 +1,17 @@
+# colcon/CMake writes compile_commands.json into build/ (repo root), which is
+# a sibling of src/ - not an ancestor of the sources. Point at it explicitly so
+# clangd never falls back to guessing flags. Paths inside the DB are container
+# paths (/workspace/..., /opt/ros/lyrical/...); clangd must run in the
+# devcontainer (see scripts/clangd-container) or they won't resolve.
+CompileFlags:
+  CompilationDatabase: build
+
+# rclcpp/rclcpp.hpp, std_msgs/... and friends are umbrella headers: they
+# contain nothing but #include lines of their own. include-cleaner maps every
+# used symbol to the header that declares it (rclcpp/node.hpp, ...), never to
+# the umbrella, so it always claims the umbrella "is not used directly".
+# Include-what-you-use is the wrong trade here - ROS convention is the
+# umbrella header - so turn that one diagnostic off. Real compile errors and
+# the rest of clang-tidy are unaffected.
+#Diagnostics:
+#  UnusedIncludes: None
