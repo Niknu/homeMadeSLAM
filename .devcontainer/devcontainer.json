@@ -1,0 +1,14 @@
+{
+  "name": "ROS Dev Container",
+  "dockerComposeFile": "docker-compose.yml",
+  "service": "ros",
+  "workspaceFolder": "/workspace",
+  "shutdownAction": "stopCompose",
+  "mounts": [
+    "source=${localEnv:HOME}/.config/git,target=/home/ubuntu/.config/git,type=bind,readonly",
+    "source=${localEnv:SSH_AUTH_SOCK},target=/ssh-agent,type=bind"
+  ],
+  "remoteEnv": {
+    "SSH_AUTH_SOCK": "/ssh-agent"
+  }
+}
