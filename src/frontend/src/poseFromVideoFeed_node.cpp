@@ -4,6 +4,7 @@
 
 #include "rclcpp/rclcpp.hpp" // IWYU pragma: export
 #include "std_msgs/msg/string.hpp"
+#include <opencv2/opencv.hpp>
 
 class MinimalPublisher : public rclcpp::Node {
 public:

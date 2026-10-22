@@ -16,6 +16,10 @@ set(ROS_PACKAGE_DEPENDENCIES
     ament_cmake
     rclcpp
     std_msgs
+    sensor_msgs
+    cv_bridge
+    image_transport
+    OpenCV
 )
 
 foreach(dep IN LISTS ROS_PACKAGE_DEPENDENCIES)
@@ -30,12 +34,15 @@ add_executable(poseFromVideoFeed_node src/poseFromVideoFeed_node.cpp)
 target_link_libraries(poseFromVideoFeed_node PUBLIC
   rclcpp::rclcpp
   std_msgs::std_msgs
+  sensor_msgs::sensor_msgs
+  cv_bridge::cv_bridge
+  image_transport::image_transport
+  ${OpenCV_LIBS}
 )
 
 target_include_directories(poseFromVideoFeed_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include/${PROJECT_NAME}>)
-#target_compile_features(poseFromVideoFeed_node PUBLIC c_std_99 cxx_std_17)  # Require C99 and C++17
 
 install(TARGETS
   poseFromVideoFeed_node
