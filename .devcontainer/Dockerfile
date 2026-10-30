@@ -25,8 +25,8 @@ RUN apt-get update && \
 RUN apt-get update && \
   apt-get install -y \
   clangd && \
-  mkdir -p /home/ubuntu/.cache/clangd && \
-  chown -R ubuntu:ubuntu /home/ubuntu/.cache
+  mkdir -p /home/ubuntu/.cache/clangd /home/ubuntu/.config && \
+  chown -R ubuntu:ubuntu /home/ubuntu/.cache /home/ubuntu/.config
 
 # Clean up apt cache to keep the image smaller
 RUN apt-get clean && rm -rf /var/lib/apt/lists/*
@@ -36,8 +36,5 @@ RUN echo "ubuntu ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/ubuntu && \
   chmod 0440 /etc/sudoers.d/ubuntu
 
 USER ubuntu
-
-# RUN python3 -m venv /opt/myvenv && \
-#  source /opt/myvenv/bin/activate
 
 CMD ["bash"]
