@@ -2,6 +2,8 @@
 KITTI_data/
 **/__pycache__/**
 
+compile_commands.json
+
 # colcon parts
 build/
 install/
