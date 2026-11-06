@@ -5,11 +5,13 @@
 #include <fstream>
 #include <iostream>
 #include <opencv2/calib3d.hpp>
+#include <opencv2/core.hpp>
 #include <opencv2/core/mat.hpp>
 #include <opencv2/core/types.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/opencv.hpp>
 #include <random>
+#include <ranges>
 #include <rclcpp/clock.hpp>
 #include <rclcpp/rclcpp.hpp> // IWYU pragma: export
 #include <sstream>
@@ -155,7 +157,9 @@ public:
     cv::waitKey(0);
   }
 
-  cv::Mat poseEstimation(cv::Mat pastImage, cv::Mat currentImage) {
+  std::tuple<cv::Mat, cv::Mat, std::vector<cv::Point2f>,
+             std::vector<cv::Point2f>>
+  poseEstimation(cv::Mat pastImage, cv::Mat currentImage) {
 
     // TODO: past image only need to be ran 1st time.
     auto [keypoint1, descriptor1] = getFeatures(pastImage);
@@ -167,6 +171,7 @@ public:
     cv::Mat E =
         cv::findEssentialMat(point1, point2, K, cv::RANSAC, 0.999, 1.0, mask);
 
+    // find valid points
     std::vector<cv::Point2f> in1, in2;
     for (int i = 0; i < mask.rows; ++i)
       if (mask.at<uchar>(i)) {
@@ -184,6 +189,7 @@ public:
     std::cout << "R = " << R << std::endl;
     std::cout << "t = " << t << std::endl;
 
+    /*
     // Transform R and t to homogeneous matrix
     cv::Mat hNew = cv::Mat::eye(4, 4, CV_64F);
 
@@ -192,13 +198,88 @@ public:
 
     // Copy the 3x1 translation vector into the top-right column
     t.copyTo(hNew(cv::Rect(3, 0, 1, 3)));
+    */
 
-    return hNew;
+    return {R, t, in1, in2};
   };
 
+  std::pair<cv::Mat, std::vector<cv::Point3f>>
+  scaling(cv::Mat &t, std::vector<cv::Point3f> &euclideanPoints) {
+
+    std::vector<double> depths;
+    std::vector<cv::Point3f> filtered3dPoints;
+    // Only keep the depths value that is positive(z)
+    for (const auto &point : euclideanPoints) {
+      if (point.z <= 0)
+        continue;
+
+      depths.push_back(point.z);
+      filtered3dPoints.push_back(point);
+    }
+
+    std::nth_element(depths.begin(), depths.begin() + depths.size() / 2,
+                     depths.end());
+    double medianDepth = depths[depths.size() / 2];
+
+    double s = 1.0 / medianDepth;
+
+    // Apply to points AND translation (both, or the map becomes inconsistent)
+    for (auto &X : filtered3dPoints)
+      X *= s;
+    cv::Mat t_scaled = t * s;
+
+    return {t_scaled, filtered3dPoints};
+  };
+
+  std::pair<cv::Mat, std::vector<cv::Point3f>>
+  triangulationAndScaling(cv::Mat projection0, cv::Mat projection1,
+                          std::vector<cv::Point2f> point0,
+                          std::vector<cv::Point2f> point1, cv::Mat t) {
+
+    cv::Mat homogeneousPoints;
+
+    cv::triangulatePoints(projection0, projection1, point0, point1,
+                          homogeneousPoints);
+    homogeneousPoints.convertTo(homogeneousPoints, CV_64F);
+
+    // TODO: Remove points with too low parallax
+
+    std::vector<cv::Point3f> euclideanPoints;
+
+    cv::convertPointsFromHomogeneous(homogeneousPoints.t(), euclideanPoints);
+
+    auto [tScaled, scaled3dPoints] = scaling(t, euclideanPoints);
+
+    // NOTE: consider: Always filter by depth sign, reprojection error, and
+    // parallax afterwards.
+
+    return {tScaled, scaled3dPoints};
+  };
+
+  void doTheFrontend(cv::Mat imageCurrent) {
+    auto [R, t, point1, point2] = poseEstimation(imagePrev, imageCurrent);
+
+    cv::Mat RtCurrent;
+    cv::hconcat(R, t, RtCurrent);
+    cv::Mat projectionCurrent = K * RtCurrent;
+
+    auto [tScaled, scaled3dPoints] = triangulationAndScaling(
+        projectionPrev, projectionCurrent, point1, point2, t);
+
+    cv::hconcat(R, tScaled, RtCurrent);
+    projectionCurrent = K * RtCurrent;
+
+    projectionPrev = projectionCurrent;
+  };
+
+  void localMapping(void) {};
+  void keyframeSelection(void) {};
+
 private:
+  cv::Mat imagePrev{};
   cv::Mat K{};
-  cv::Mat hPrev{};
+  cv::Mat projectionPrev{};
+  bool firstRun{true};
 };
 
 class MinimalPublisher : public rclcpp::Node {
