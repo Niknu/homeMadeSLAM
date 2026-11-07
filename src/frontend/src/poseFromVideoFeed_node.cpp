@@ -1,27 +1,46 @@
-// #include <chrono>
-// #include <memory>
 #include "sensor_msgs/msg/image.hpp"
 #include <cv_bridge/cv_bridge.hpp> // cv_bridge converts between ROS 2 image messages and OpenCV image representations
+#include <deque>
 #include <fstream>
-#include <iostream>
+#include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
+#include <nav_msgs/msg/path.hpp>
 #include <opencv2/calib3d.hpp>
 #include <opencv2/core.hpp>
 #include <opencv2/core/mat.hpp>
 #include <opencv2/core/types.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/opencv.hpp>
+#include <map>
+#include <optional>
 #include <random>
-#include <ranges>
-#include <rclcpp/clock.hpp>
 #include <rclcpp/rclcpp.hpp> // IWYU pragma: export
+#include <sensor_msgs/msg/camera_info.hpp>
+#include <sensor_msgs/msg/point_cloud2.hpp>
+#include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <sstream>
-#include <std_msgs/msg/string.hpp>
 #include <string>
+#include <tf2/LinearMath/Matrix3x3.hpp>
+#include <tf2/LinearMath/Quaternion.hpp>
+#include <tf2_ros/transform_broadcaster.hpp>
 #include <unordered_map>
+
+// Result of one processed frame, everything expressed in the world frame
+// (= optical frame of the first camera).
+struct FrameResult {
+  cv::Mat T_wc; // 4x4 pose of the current camera in the world
+  std::vector<cv::Point3f> pointsWorld;
+};
 
 class FrontendClass {
 public:
   FrontendClass() { loadCameraInsintric(); }
+
+  void setK(const cv::Mat &newK) { K = newK.clone(); }
+  void setTranslationScale(double s) { translationScale = s; }
+  // Force the length of the next frame-to-frame translation (e.g. from ground
+  // truth). Used once by the next processFrame call.
+  void setNextStepLength(double length) { nextStepLength = length; }
 
   static std::unordered_map<std::string, cv::Mat>
   loadCalibKitti(const std::string &path) {
@@ -38,16 +57,6 @@ public:
       m[line.substr(0, colon)] = a;
     }
     return m;
-  }
-
-  static cv::Mat rosImage2OpencvImage(void) {
-
-    cv::Mat my_image =
-        cv::imread("/workspace/src/KITTI_data/data_odometry_color/dataset/"
-                   "sequences/00/image_2/000000.png",
-                   cv::IMREAD_COLOR);
-
-    return my_image;
   }
 
   void loadCameraInsintric(std::string path =
@@ -67,7 +76,11 @@ public:
     std::vector<cv::KeyPoint> keypoints;
     cv::Mat descriptor;
 
-    detector->detectAndCompute(img, cv::noArray(), keypoints, descriptor);
+    cv::Mat gray = img;
+    if (img.channels() == 3)
+      cv::cvtColor(img, gray, cv::COLOR_BGR2GRAY);
+
+    detector->detectAndCompute(gray, cv::noArray(), keypoints, descriptor);
 
     return {keypoints, descriptor};
   }
@@ -184,10 +197,9 @@ public:
     drawEpilinesShowImage(pastImage, currentImage, in1, in2, F);
     */
     cv::Mat R, t;
-    int nGood = cv::recoverPose(E, in1, in2, R, t);
-    std::cout << "nGood = " << nGood << std::endl;
-    std::cout << "R = " << R << std::endl;
-    std::cout << "t = " << t << std::endl;
+    // recoverPose uses K to normalise the points; passing only E would assume
+    // focal=1, pp=(0,0).
+    cv::recoverPose(E, in1, in2, K, R, t);
 
     /*
     // Transform R and t to homogeneous matrix
@@ -217,6 +229,10 @@ public:
       filtered3dPoints.push_back(point);
     }
 
+    if (depths.empty()) {
+      throw std::runtime_error("No triangulated points in front of camera");
+    }
+
     std::nth_element(depths.begin(), depths.begin() + depths.size() / 2,
                      depths.end());
     double medianDepth = depths[depths.size() / 2];
@@ -224,11 +240,18 @@ public:
     double s = 1.0 / medianDepth;
 
     // Apply to points AND translation (both, or the map becomes inconsistent)
-    for (auto &X : filtered3dPoints)
+    // Points far beyond the median depth are mostly low-parallax noise.
+    const float maxScaledDepth = 10.0f;
+    std::vector<cv::Point3f> scaledPoints;
+    scaledPoints.reserve(filtered3dPoints.size());
+    for (auto &X : filtered3dPoints) {
       X *= s;
+      if (X.z <= maxScaledDepth)
+        scaledPoints.push_back(X);
+    }
     cv::Mat t_scaled = t * s;
 
-    return {t_scaled, filtered3dPoints};
+    return {t_scaled, scaledPoints};
   };
 
   std::pair<cv::Mat, std::vector<cv::Point3f>>
@@ -240,7 +263,8 @@ public:
 
     cv::triangulatePoints(projection0, projection1, point0, point1,
                           homogeneousPoints);
-    homogeneousPoints.convertTo(homogeneousPoints, CV_64F);
+    // Point3f output requires float input to convertPointsFromHomogeneous
+    homogeneousPoints.convertTo(homogeneousPoints, CV_32F);
 
     // TODO: Remove points with too low parallax
 
@@ -256,9 +280,21 @@ public:
     return {tScaled, scaled3dPoints};
   };
 
-  void doTheFrontend(cv::Mat imageCurrent) {
+  // Returns the current camera pose and the newly triangulated points, both in
+  // the world frame. Throws if the frame could not be tracked; in that case the
+  // previous image and pose are kept so the next frame is matched against it.
+  FrameResult processFrame(cv::Mat imageCurrent) {
+    if (!initialized) {
+      imagePrev = imageCurrent;
+      initialized = true;
+      return {T_cw.inv(), {}};
+    }
+
+    // R, t: motion from the previous camera to the current one (x2 = R*x1 + t)
     auto [R, t, point1, point2] = poseEstimation(imagePrev, imageCurrent);
 
+    // Triangulate in the previous camera frame: P0 = K[I|0], P1 = K[R|t]
+    cv::Mat projectionPrev = K * cv::Mat::eye(3, 4, CV_64F);
     cv::Mat RtCurrent;
     cv::hconcat(R, t, RtCurrent);
     cv::Mat projectionCurrent = K * RtCurrent;
@@ -266,10 +302,39 @@ public:
     auto [tScaled, scaled3dPoints] = triangulationAndScaling(
         projectionPrev, projectionCurrent, point1, point2, t);
 
-    cv::hconcat(R, tScaled, RtCurrent);
-    projectionCurrent = K * RtCurrent;
+    tScaled *= translationScale;
+    double pointScale = translationScale;
+    if (nextStepLength) {
+      const double norm = cv::norm(tScaled);
+      if (norm > 1e-9) {
+        const double k = *nextStepLength / norm;
+        tScaled *= k;
+        pointScale *= k;
+      }
+      nextStepLength.reset();
+    }
 
-    projectionPrev = projectionCurrent;
+    // Chain the relative motion onto the world pose
+    cv::Mat T_rel = cv::Mat::eye(4, 4, CV_64F);
+    R.copyTo(T_rel(cv::Rect(0, 0, 3, 3)));
+    tScaled.copyTo(T_rel(cv::Rect(3, 0, 1, 3)));
+
+    cv::Mat T_wc_prev = T_cw.inv();
+    T_cw = T_rel * T_cw;
+
+    // Previous camera frame -> world frame
+    std::vector<cv::Point3f> pointsWorld;
+    pointsWorld.reserve(scaled3dPoints.size());
+    const cv::Matx44d T(T_wc_prev);
+    for (const auto &p : scaled3dPoints) {
+      const double s = pointScale;
+      cv::Vec4d Xw = T * cv::Vec4d(p.x * s, p.y * s, p.z * s, 1.0);
+      pointsWorld.emplace_back(Xw[0], Xw[1], Xw[2]);
+    }
+
+    imagePrev = imageCurrent;
+
+    return {T_cw.inv(), pointsWorld};
   };
 
   void localMapping(void) {};
@@ -278,63 +343,225 @@ public:
 private:
   cv::Mat imagePrev{};
   cv::Mat K{};
-  cv::Mat projectionPrev{};
-  bool firstRun{true};
+  cv::Mat T_cw{cv::Mat::eye(4, 4, CV_64F)}; // world -> current camera
+  double translationScale{1.0};
+  std::optional<double> nextStepLength{};
+  bool initialized{false};
 };
 
-class MinimalPublisher : public rclcpp::Node {
+class FrontendNode : public rclcpp::Node {
 public:
-  MinimalPublisher() : Node("minimal_publisher"), count_(0) {
-    publisher_ = this->create_publisher<std_msgs::msg::String>(
-        "/vslam/fronend/camera", 1);
-    publisherImage_ = this->create_publisher<sensor_msgs::msg::Image>(
-        "/vslam/frontend/image", 1);
+  FrontendNode() : Node("slam_frontend") {
+    const auto imageTopic = declare_parameter<std::string>(
+        "image_topic", "/kitti/camera/left/image_raw");
+    const auto cameraInfoTopic = declare_parameter<std::string>(
+        "camera_info_topic", "/kitti/camera/left/camera_info");
+    worldFrame_ = declare_parameter<std::string>("world_frame", "world");
+    cameraFrame_ =
+        declare_parameter<std::string>("camera_frame", "camera_optical_frame");
+    front_.setTranslationScale(
+        declare_parameter<double>("translation_scale", 1.0));
+    alignWorldWithRos_ = declare_parameter<bool>("align_world_with_ros", true);
+    const auto gtTopic = declare_parameter<std::string>(
+        "ground_truth_topic", "/kitti/ground_truth/pose_world");
+    useGtScale_ = declare_parameter<bool>("use_gt_scale", false);
+    mapPointStride_ = std::max<int64_t>(
+        1, declare_parameter<int64_t>("map_point_stride", 2));
+    mapPublishEveryN_ = std::max<int64_t>(
+        1, declare_parameter<int64_t>("map_publish_every_n_frames", 5));
+    maxMapPoints_ = static_cast<std::size_t>(std::max<int64_t>(
+        1, declare_parameter<int64_t>("max_map_points", 300000)));
 
-    auto timer_callback = [this]() -> void {
-      auto message = std_msgs::msg::String();
-      message.data = "Hello, world! " + std::to_string(this->count_++);
-      publisher_->publish(message);
+    // Optical frame of the first camera (x right, y down, z forward) ->
+    // ROS world (x forward, y left, z up).
+    A_ = cv::Matx44d::eye();
+    if (alignWorldWithRos_) {
+      A_ = cv::Matx44d(0, 0, 1, 0,  //
+                       -1, 0, 0, 0, //
+                       0, -1, 0, 0, //
+                       0, 0, 0, 1);
+    }
 
-      cv::Mat img = FrontendClass::rosImage2OpencvImage();
+    posePub_ = create_publisher<geometry_msgs::msg::PoseStamped>(
+        "/vslam/frontend/pose", 10);
+    pathPub_ =
+        create_publisher<nav_msgs::msg::Path>("/vslam/frontend/path", 10);
+    mapPub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
+        "/vslam/frontend/map", 1);
+    tfBroadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
-      // Write message to be sent. Member function toImageMsg() converts a
-      // CvImage into a ROS image message
-      auto msg_ = std::make_unique<sensor_msgs::msg::Image>();
-      cv_bridge::CvImage(std_msgs::msg::Header(), "bgr8", img)
-          .toImageMsg(*msg_);
-      msg_->header.stamp = rclcpp::Clock().now();
+    cameraInfoSub_ = create_subscription<sensor_msgs::msg::CameraInfo>(
+        cameraInfoTopic, 10,
+        [this](sensor_msgs::msg::CameraInfo::ConstSharedPtr msg) {
+          if (haveCameraInfo_)
+            return;
+          cv::Mat K(3, 3, CV_64F);
+          for (int i = 0; i < 9; ++i)
+            K.at<double>(i / 3, i % 3) = msg->k[i];
+          front_.setK(K);
+          haveCameraInfo_ = true;
+          RCLCPP_INFO_STREAM(get_logger(), "Camera intrinsics from "
+                                               "camera_info:\n"
+                                               << K);
+        });
 
-      publisherImage_->publish(*msg_);
-    };
-    timer_ = this->create_wall_timer(std::chrono::milliseconds(1000),
-                                     timer_callback);
+    // Ground truth positions, keyed by stamp, so each processed image can look
+    // up the true step length (only used with use_gt_scale).
+    gtSub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
+        gtTopic, 50, [this](geometry_msgs::msg::PoseStamped::ConstSharedPtr m) {
+          const auto &p = m->pose.position;
+          gtPositions_[rclcpp::Time(m->header.stamp).nanoseconds()] =
+              cv::Vec3d(p.x, p.y, p.z);
+          while (gtPositions_.size() > 500)
+            gtPositions_.erase(gtPositions_.begin());
+        });
+
+    // Depth 1: if SIFT is slower than the camera, drop old frames.
+    imageSub_ = create_subscription<sensor_msgs::msg::Image>(
+        imageTopic, rclcpp::QoS(1),
+        [this](sensor_msgs::msg::Image::ConstSharedPtr msg) {
+          onImage(msg);
+        });
+
+    RCLCPP_INFO(get_logger(), "Listening for images on %s",
+                imageTopic.c_str());
   }
 
 private:
-  rclcpp::TimerBase::SharedPtr timer_;
-  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr publisher_;
-  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr publisherImage_;
-  size_t count_;
+  void onImage(const sensor_msgs::msg::Image::ConstSharedPtr &msg) {
+    cv::Mat img;
+    try {
+      img = cv_bridge::toCvShare(msg, "bgr8")->image.clone();
+    } catch (const cv_bridge::Exception &e) {
+      RCLCPP_WARN(get_logger(), "cv_bridge: %s", e.what());
+      return;
+    }
+
+    const int64_t stampNs = rclcpp::Time(msg->header.stamp).nanoseconds();
+    if (useGtScale_ && prevStampNs_) {
+      auto cur = gtPositions_.find(stampNs);
+      auto prev = gtPositions_.find(*prevStampNs_);
+      if (cur != gtPositions_.end() && prev != gtPositions_.end()) {
+        front_.setNextStepLength(cv::norm(cur->second - prev->second));
+      } else {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                             "use_gt_scale: no ground truth for this stamp");
+      }
+    }
+
+    FrameResult result;
+    try {
+      result = front_.processFrame(img);
+      prevStampNs_ = stampNs;
+    } catch (const std::exception &e) {
+      RCLCPP_WARN(get_logger(), "Frame skipped: %s", e.what());
+      return;
+    }
+
+    const auto &stamp = msg->header.stamp;
+    publishPose(cv::Matx44d(result.T_wc), stamp);
+    addToMap(result.pointsWorld);
+
+    if (++frameCount_ % mapPublishEveryN_ == 0)
+      publishMap(stamp);
+  }
+
+  void publishPose(const cv::Matx44d &T_wc, const builtin_interfaces::msg::Time &stamp) {
+    const cv::Matx44d T = A_ * T_wc;
+
+    tf2::Matrix3x3 rot(T(0, 0), T(0, 1), T(0, 2), //
+                       T(1, 0), T(1, 1), T(1, 2), //
+                       T(2, 0), T(2, 1), T(2, 2));
+    tf2::Quaternion q;
+    rot.getRotation(q);
+
+    geometry_msgs::msg::PoseStamped pose;
+    pose.header.stamp = stamp;
+    pose.header.frame_id = worldFrame_;
+    pose.pose.position.x = T(0, 3);
+    pose.pose.position.y = T(1, 3);
+    pose.pose.position.z = T(2, 3);
+    pose.pose.orientation.x = q.x();
+    pose.pose.orientation.y = q.y();
+    pose.pose.orientation.z = q.z();
+    pose.pose.orientation.w = q.w();
+    posePub_->publish(pose);
+
+    path_.header = pose.header;
+    path_.poses.push_back(pose);
+    pathPub_->publish(path_);
+
+    geometry_msgs::msg::TransformStamped tf;
+    tf.header = pose.header;
+    tf.child_frame_id = cameraFrame_;
+    tf.transform.translation.x = pose.pose.position.x;
+    tf.transform.translation.y = pose.pose.position.y;
+    tf.transform.translation.z = pose.pose.position.z;
+    tf.transform.rotation = pose.pose.orientation;
+    tfBroadcaster_->sendTransform(tf);
+  }
+
+  void addToMap(const std::vector<cv::Point3f> &pointsWorld) {
+    for (std::size_t i = 0; i < pointsWorld.size();
+         i += static_cast<std::size_t>(mapPointStride_)) {
+      const auto &p = pointsWorld[i];
+      const cv::Vec4d X = A_ * cv::Vec4d(p.x, p.y, p.z, 1.0);
+      map_.emplace_back(X[0], X[1], X[2]);
+    }
+    while (map_.size() > maxMapPoints_)
+      map_.pop_front();
+  }
+
+  void publishMap(const builtin_interfaces::msg::Time &stamp) {
+    sensor_msgs::msg::PointCloud2 cloud;
+    cloud.header.stamp = stamp;
+    cloud.header.frame_id = worldFrame_;
+
+    sensor_msgs::PointCloud2Modifier modifier(cloud);
+    modifier.setPointCloud2FieldsByString(1, "xyz");
+    modifier.resize(map_.size());
+
+    sensor_msgs::PointCloud2Iterator<float> x(cloud, "x"), y(cloud, "y"),
+        z(cloud, "z");
+    for (const auto &p : map_) {
+      *x = p.x;
+      *y = p.y;
+      *z = p.z;
+      ++x, ++y, ++z;
+    }
+    mapPub_->publish(cloud);
+  }
+
+  FrontendClass front_;
+
+  std::string worldFrame_;
+  std::string cameraFrame_;
+  bool alignWorldWithRos_{true};
+  int64_t mapPointStride_{2};
+  int64_t mapPublishEveryN_{5};
+  std::size_t maxMapPoints_{300000};
+  cv::Matx44d A_;
+
+  bool haveCameraInfo_{false};
+  bool useGtScale_{false};
+  std::map<int64_t, cv::Vec3d> gtPositions_;
+  std::optional<int64_t> prevStampNs_;
+  int64_t frameCount_{0};
+  nav_msgs::msg::Path path_;
+  std::deque<cv::Point3f> map_;
+
+  rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr imageSub_;
+  rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr cameraInfoSub_;
+  rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr gtSub_;
+  rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr posePub_;
+  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pathPub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr mapPub_;
+  std::unique_ptr<tf2_ros::TransformBroadcaster> tfBroadcaster_;
 };
 
 int main(int argc, char *argv[]) {
-
-  FrontendClass front;
-
-  cv::Mat my_image =
-      cv::imread("/workspace/src/KITTI_data/data_odometry_color/dataset/"
-                 "sequences/00/image_2/000000.png",
-                 cv::IMREAD_COLOR);
-
-  cv::Mat my_image1 =
-      cv::imread("/workspace/src/KITTI_data/data_odometry_color/dataset/"
-                 "sequences/00/image_2/000002.png",
-                 cv::IMREAD_COLOR);
-
-  front.poseEstimation(my_image, my_image1);
-
   rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<MinimalPublisher>());
+  rclcpp::spin(std::make_shared<FrontendNode>());
   rclcpp::shutdown();
   return 0;
 }

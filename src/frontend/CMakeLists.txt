@@ -17,6 +17,10 @@ set(ROS_PACKAGE_DEPENDENCIES
     rclcpp
     std_msgs
     sensor_msgs
+    geometry_msgs
+    nav_msgs
+    tf2
+    tf2_ros
     cv_bridge
     image_transport
     OpenCV
@@ -35,6 +39,10 @@ target_link_libraries(poseFromVideoFeed_node PUBLIC
   rclcpp::rclcpp
   std_msgs::std_msgs
   sensor_msgs::sensor_msgs
+  ${geometry_msgs_TARGETS}
+  ${nav_msgs_TARGETS}
+  tf2::tf2
+  tf2_ros::tf2_ros
   cv_bridge::cv_bridge
   image_transport::image_transport
   ${OpenCV_LIBS}
@@ -50,6 +58,7 @@ install(TARGETS
 
 install(DIRECTORY
   launch
+  rviz
   DESTINATION share/${PROJECT_NAME})
 
 if(BUILD_TESTING)

@@ -1,0 +1,199 @@
+{
+  "configById": {
+    "Image!3xkqk1v": {
+      "imageMode": {
+        "imageTopic": "/kitti/camera/left/image_raw"
+      },
+      "cameraState": {
+        "distance": 20,
+        "perspective": true,
+        "phi": 60,
+        "target": [
+          0,
+          0,
+          0
+        ],
+        "targetOffset": [
+          0,
+          0,
+          0
+        ],
+        "targetOrientation": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "thetaOffset": 60,
+        "fovy": 45,
+        "near": 0.5,
+        "far": 5000
+      },
+      "followMode": "follow-pose",
+      "scene": {},
+      "transforms": {},
+      "topics": {},
+      "layers": {},
+      "publish": {
+        "type": "point",
+        "poseTopic": "/move_base_simple/goal",
+        "pointTopic": "/clicked_point",
+        "poseEstimateTopic": "/initialpose",
+        "poseEstimateXDeviation": 0.5,
+        "poseEstimateYDeviation": 0.5,
+        "poseEstimateThetaDeviation": 0.26179939
+      },
+      "synchronize": false
+    },
+    "3D!3nr5em3": {
+      "topics": {
+        "/vslam/frontend/pose": {
+          "visible": false,
+          "axisScale": 4.5
+        },
+        "/vslam/frontend/path": {
+          "visible": true,
+          "lineWidth": 3,
+          "gradient": [
+            "#ff0000ff",
+            "#f8000080"
+          ]
+        },
+        "/vslam/frontend/map": {
+          "visible": false,
+          "colorField": "z",
+          "colorMode": "colormap",
+          "colorMap": "turbo"
+        },
+        "/kitti/ground_truth/path": {
+          "visible": true,
+          "lineWidth": 3,
+          "gradient": [
+            "#0003ffff",
+            "#796bff80"
+          ]
+        },
+        "/kitti/ground_truth/pose": {
+          "visible": false,
+          "axisScale": 4
+        },
+        "/kitti/camera/left/image_raw": {
+          "visible": false,
+          "frameLocked": true,
+          "cameraInfoTopic": "/kitti/camera/left/camera_info",
+          "distance": 1,
+          "planarProjectionFactor": 0,
+          "renderMode": "default",
+          "projectionFrameId": "world",
+          "color": "#ffffff",
+          "rectifyImage": true,
+          "pointSize": 1.5,
+          "syncModeEnabled": false
+        },
+        "/initialpose": {
+          "visible": false
+        }
+      },
+      "layers": {
+        "35010e55-0cff-402d-82d9-a17a52ca649d": {
+          "layerId": "foxglove.Grid",
+          "instanceId": "35010e55-0cff-402d-82d9-a17a52ca649d",
+          "visible": true
+        }
+      },
+      "cameraState": {
+        "perspective": true,
+        "distance": 937.0431689363453,
+        "phi": 59.39399669227762,
+        "thetaOffset": 156.969697004616,
+        "targetOffset": [
+          203.53881832262644,
+          27.459593247224383,
+          25.237912810132023
+        ],
+        "target": [
+          0,
+          0,
+          0
+        ],
+        "targetOrientation": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "fovy": 45,
+        "near": 0.5,
+        "far": 5000
+      },
+      "followMode": "follow-pose",
+      "scene": {},
+      "transforms": {},
+      "publish": {
+        "type": "point",
+        "poseTopic": "/move_base_simple/goal",
+        "pointTopic": "/clicked_point",
+        "poseEstimateTopic": "/initialpose",
+        "poseEstimateXDeviation": 0.5,
+        "poseEstimateYDeviation": 0.5,
+        "poseEstimateThetaDeviation": 0.26179939
+      },
+      "synchronize": false,
+      "imageMode": {},
+      "followTf": "world"
+    },
+    "Plot!4fvn4oi": {
+      "paths": [
+        {
+          "value": "/kitti/ground_truth/pose.pose.position.y",
+          "enabled": true,
+          "color": "#4e98e2",
+          "id": "fc31d2f7-7a3c-42b7-8163-4511d283d143",
+          "timestampMethod": "customField",
+          "timestampPath": "/kitti/ground_truth/pose.pose.position.x",
+          "xValuePath": "/kitti/ground_truth/pose.pose.position.x",
+          "showLine": false
+        },
+        {
+          "timestampMethod": "receiveTime",
+          "value": "/vslam/frontend/pose.pose.position.y",
+          "enabled": true,
+          "color": "#f5774d",
+          "id": "cfc88367-397a-4213-a24b-8cb284ecdc7d",
+          "xValuePath": "/vslam/frontend/pose.pose.position.x"
+        }
+      ],
+      "showLegend": true,
+      "foxglovePanelTitle": "Position",
+      "showXAxisLabels": true,
+      "xAxisLabel": "Position ",
+      "timeRange": "all",
+      "xAxisVal": "custom"
+    },
+    "Tab!42s3c6n": {
+      "activeTabIdx": 0,
+      "tabs": [
+        {
+          "title": "Overview",
+          "layout": {
+            "direction": "column",
+            "first": "Image!3xkqk1v",
+            "second": {
+              "direction": "row",
+              "first": "3D!3nr5em3",
+              "second": "Plot!4fvn4oi",
+              "splitPercentage": 41.008174386920984
+            },
+            "splitPercentage": 28.57142857142857
+          }
+        }
+      ]
+    }
+  },
+  "layout": "Tab!42s3c6n",
+  "globalVariables": {},
+  "playbackConfig": {
+    "speed": 1
+  },
+  "userNodes": {}
+}

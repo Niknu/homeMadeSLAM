@@ -15,7 +15,8 @@ RUN wget -O /tmp/foxglove-studio.deb \
 
 RUN apt-get update && \ 
   apt-get install -y \ 
-  foxglove-studio
+  foxglove-studio \
+  ros-${ROS_DISTRO}-foxglove-bridge
 
 # --- Language server for editor-side diagnostics ---
 # clangd runs inside the container (see the docker exec cmd in nvim) so it sees

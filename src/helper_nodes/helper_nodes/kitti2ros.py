@@ -5,6 +5,7 @@ import pathlib
 
 import cv2
 from geometry_msgs.msg import PoseStamped, TransformStamped
+from nav_msgs.msg import Path
 import numpy as np
 import rclpy
 from rclpy.node import Node
@@ -25,12 +26,24 @@ class KittiPublisher(Node):
         self.declare_parameter("playback_rate", 10.0)
         self.declare_parameter("loop", False)
         self.declare_parameter("child_frame", "camera_link")
+        # Frame and alignment used by the SLAM frontend, so the ground truth
+        # can be drawn on top of the estimated trajectory.
+        self.declare_parameter("world_frame", "world")
+        self.declare_parameter("align_world_with_ros", True)
 
         self.sequence = str(self.get_parameter("sequence").value)
         self.kitti_path = pathlib.Path(self.get_parameter("kitti_path").value)
         self.playback_rate = float(self.get_parameter("playback_rate").value)
         self.loop = self.parse_bool(self.get_parameter("loop").value)
         self.child_frame = self.get_parameter("child_frame").value
+        self.world_frame = self.get_parameter("world_frame").value
+        # Optical frame (x right, y down, z forward) -> ROS (x fwd, y left, z up)
+        self.world_align = (
+            np.array([[0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]])
+            if self.parse_bool(self.get_parameter("align_world_with_ros").value)
+            else np.eye(3)
+        )
+        self.gt_path = Path()
 
         self.frame_id = "kitti_frame"
 
@@ -51,6 +64,12 @@ class KittiPublisher(Node):
             CameraInfo, "/kitti/camera/left/camera_info", 10
         )
         self.timestamp_pub = self.create_publisher(Float64, "/kitti/timestamps", 10)
+        self.gt_world_pose_pub = self.create_publisher(
+            PoseStamped, "/kitti/ground_truth/pose_world", 10
+        )
+        self.gt_path_pub = self.create_publisher(
+            Path, "/kitti/ground_truth/path", 10
+        )
         self.tf_broadcaster = TransformBroadcaster(self)
 
         timer_period = 1.0 / self.playback_rate
@@ -157,6 +176,27 @@ class KittiPublisher(Node):
             z = 0.25 * s
         return x, y, z, w
 
+    def publish_ground_truth_world(self, pose_matrix, stamp):
+        """Publish the ground truth pose and path in the SLAM world frame."""
+        position = self.world_align @ pose_matrix[:3, 3]
+        x, y, z, w = self.matrix_to_quaternion(self.world_align @ pose_matrix[:3, :3])
+
+        msg = PoseStamped()
+        msg.header.stamp = stamp
+        msg.header.frame_id = self.world_frame
+        msg.pose.position.x = float(position[0])
+        msg.pose.position.y = float(position[1])
+        msg.pose.position.z = float(position[2])
+        msg.pose.orientation.x = float(x)
+        msg.pose.orientation.y = float(y)
+        msg.pose.orientation.z = float(z)
+        msg.pose.orientation.w = float(w)
+        self.gt_world_pose_pub.publish(msg)
+
+        self.gt_path.header = msg.header
+        self.gt_path.poses.append(msg)
+        self.gt_path_pub.publish(self.gt_path)
+
     def load_image(self, index):
         """Load a KITTI image and wrap it in a ROS 2 Image message."""
         image_path = self.image_files[index]
@@ -204,6 +244,7 @@ class KittiPublisher(Node):
         if self.current_frame >= len(self.image_files):
             if self.loop:
                 self.current_frame = 0
+                self.gt_path = Path()
             else:
                 self.get_logger().info("Finished publishing all frames")
                 self.timer.cancel()
@@ -228,6 +269,7 @@ class KittiPublisher(Node):
         pose_msg.pose.orientation.w = w
 
         self.pose_pub.publish(pose_msg)
+        self.publish_ground_truth_world(pose_matrix, stamp)
 
         image_msg = self.load_image(index)
         image_msg.header.stamp = stamp
