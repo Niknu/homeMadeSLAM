@@ -1,4 +1,6 @@
 #include "sensor_msgs/msg/image.hpp"
+#include <algorithm>
+#include <cmath>
 #include <cv_bridge/cv_bridge.hpp> // cv_bridge converts between ROS 2 image messages and OpenCV image representations
 #include <deque>
 #include <fstream>
@@ -30,7 +32,19 @@
 struct FrameResult {
   cv::Mat T_wc; // 4x4 pose of the current camera in the world
   std::vector<cv::Point3f> pointsWorld;
-  bool standingStill{false}; // pose held, keyframe (imagePrev) kept
+  bool standingStill{false}; // pose held, keyframe kept
+  bool scaleReset{false};    // tracking lost, scale re-guessed from last step
+  double stepLength{0.0};    // camera motion since the previous keyframe
+  int trackedPoints{0};      // PnP inliers (0 if the essential matrix was used)
+};
+
+// A processed frame. points[i] is the world point seen by keypoints[i], if
+// one has been triangulated; these points carry the map scale forward.
+struct TrackedFrame {
+  std::vector<cv::KeyPoint> keypoints;
+  cv::Mat descriptors;
+  std::vector<std::optional<cv::Point3d>> points;
+  cv::Mat T_cw; // world -> camera
 };
 
 class FrontendClass {
@@ -38,10 +52,17 @@ public:
   FrontendClass() { loadCameraInsintric(); }
 
   void setK(const cv::Mat &newK) { K = newK.clone(); }
+  // Length of the first step; it defines the unit of the whole map.
   void setTranslationScale(double s) { translationScale = s; }
-  // Force the length of the next frame-to-frame translation (e.g. from ground
-  // truth). Used once by the next processFrame call.
+  // Force the length of the next initialisation step (e.g. from ground
+  // truth). Ignored while the frame is tracked against the map.
   void setNextStepLength(double length) { nextStepLength = length; }
+  void setTrackingThresholds(int minInliers, double reprojPx,
+                             double minParallax) {
+    minPnpInliers = minInliers;
+    pnpReprojPx = reprojPx;
+    minParallaxDeg = minParallax;
+  }
   void setStandstillThresholds(double flowPx, double staticFraction,
                                double minParallaxPx) {
     standstillFlowPx = flowPx;
@@ -115,11 +136,9 @@ public:
     return {keypoints, descriptor};
   }
 
-  std::pair<std::vector<cv::Point2f>, std::vector<cv::Point2f>>
-  getBestFeatureMatches(std::vector<cv::KeyPoint> keypoint1,
-                        cv::Mat descriptor1,
-                        std::vector<cv::KeyPoint> keypoint2,
-                        cv::Mat descriptor2) {
+  // queryIdx indexes descriptor1, trainIdx descriptor2
+  std::vector<cv::DMatch> getBestFeatureMatches(const cv::Mat &descriptor1,
+                                                const cv::Mat &descriptor2) {
 
     cv::BFMatcher matcher(cv::NORM_L2); // cv::FlannBasedMatcher for big sets
     std::vector<std::vector<cv::DMatch>> knn;
@@ -139,14 +158,7 @@ public:
       throw std::runtime_error("Not enough matches");
     }
 
-    // p1[i] <-> p2[i] <-> matches[i]: same order, so masks line up
-    std::vector<cv::Point2f> p1, p2;
-    for (const auto &m : matches) {
-      p1.push_back(keypoint1[m.queryIdx].pt);
-      p2.push_back(keypoint2[m.trainIdx].pt);
-    }
-
-    return {p1, p2};
+    return matches;
   }
 
   static void drawEpilines(cv::Mat &img, const std::vector<cv::Vec3f> &lines,
@@ -200,20 +212,11 @@ public:
     cv::waitKey(0);
   }
 
-  // Returns std::nullopt if the camera is standing still.
-  std::optional<std::tuple<cv::Mat, cv::Mat, std::vector<cv::Point2f>,
-                           std::vector<cv::Point2f>>>
-  poseEstimation(cv::Mat pastImage, cv::Mat currentImage) {
-
-    // TODO: past image only need to be ran 1st time.
-    auto [keypoint1, descriptor1] = getFeatures(pastImage);
-    auto [keypoint2, descriptor2] = getFeatures(currentImage);
-
-    auto [point1, point2] =
-        getBestFeatureMatches(keypoint1, descriptor1, keypoint2, descriptor2);
-
-    if (isStandingStill(point1, point2))
-      return std::nullopt;
+  // Relative motion from the essential matrix (x2 = R*x1 + t), |t| = 1: the
+  // scale is unknown, so this is only used to (re-)initialise the map.
+  std::pair<cv::Mat, cv::Mat>
+  poseEstimation(const std::vector<cv::Point2f> &point1,
+                 const std::vector<cv::Point2f> &point2) {
 
     cv::Mat mask;
     cv::Mat E =
@@ -247,151 +250,194 @@ public:
     t.copyTo(hNew(cv::Rect(3, 0, 1, 3)));
     */
 
-    return std::tuple{R, t, in1, in2};
+    return {R, t};
   };
 
-  std::pair<cv::Mat, std::vector<cv::Point3f>>
-  scaling(cv::Mat &t, std::vector<cv::Point3f> &euclideanPoints) {
+  static cv::Vec3d cameraCentre(const cv::Mat &T_cw) {
+    const cv::Matx44d T(T_cw);
+    const cv::Matx33d R = T.get_minor<3, 3>(0, 0);
+    return -(R.t() * cv::Vec3d(T(0, 3), T(1, 3), T(2, 3)));
+  }
 
-    std::vector<double> depths;
-    std::vector<cv::Point3f> filtered3dPoints;
-    // Only keep the depths value that is positive(z)
-    for (const auto &point : euclideanPoints) {
-      if (point.z <= 0)
+  // Pose of the current frame from the world points seen by the previous one.
+  // Because those points are already in the map's unit, the scale carries
+  // over. Inlier points are handed on to cur.points.
+  bool trackWithPnp(const std::vector<cv::DMatch> &matches,
+                    TrackedFrame &cur) const {
+    std::vector<cv::Point3d> object;
+    std::vector<cv::Point2d> image;
+    std::vector<const cv::DMatch *> used;
+    for (const auto &m : matches) {
+      if (const auto &X = prev.points[m.queryIdx]) {
+        object.push_back(*X);
+        image.emplace_back(cur.keypoints[m.trainIdx].pt);
+        used.push_back(&m);
+      }
+    }
+    if (static_cast<int>(object.size()) < minPnpInliers)
+      return false;
+
+    // Seed with the previous pose; the camera moves little between frames.
+    cv::Mat rvec, tvec = prev.T_cw(cv::Rect(3, 0, 1, 3)).clone();
+    cv::Rodrigues(prev.T_cw(cv::Rect(0, 0, 3, 3)), rvec);
+    std::vector<int> inliers;
+    if (!cv::solvePnPRansac(object, image, K, cv::noArray(), rvec, tvec, true,
+                            100, pnpReprojPx, 0.999, inliers) ||
+        static_cast<int>(inliers.size()) < minPnpInliers)
+      return false;
+
+    cv::Mat R;
+    cv::Rodrigues(rvec, R);
+    cur.T_cw = cv::Mat::eye(4, 4, CV_64F);
+    R.copyTo(cur.T_cw(cv::Rect(0, 0, 3, 3)));
+    tvec.copyTo(cur.T_cw(cv::Rect(3, 0, 1, 3)));
+
+    for (int i : inliers)
+      cur.points[used[i]->trainIdx] = prev.points[used[i]->queryIdx];
+    return true;
+  }
+
+  // Triangulates the matches that have no world point yet, from the two known
+  // poses, so the points come out directly in the world frame and unit.
+  // Returns the subset with enough parallax for the map.
+  std::vector<cv::Point3f>
+  triangulateNew(const std::vector<cv::DMatch> &matches,
+                 TrackedFrame &cur) const {
+    std::vector<cv::Point2f> p0, p1;
+    std::vector<int> curIdx;
+    for (const auto &m : matches) {
+      if (cur.points[m.trainIdx])
+        continue;
+      p0.push_back(prev.keypoints[m.queryIdx].pt);
+      p1.push_back(cur.keypoints[m.trainIdx].pt);
+      curIdx.push_back(m.trainIdx);
+    }
+    if (p0.empty())
+      return {};
+
+    cv::Mat X;
+    cv::triangulatePoints(K * prev.T_cw.rowRange(0, 3),
+                          K * cur.T_cw.rowRange(0, 3), p0, p1, X);
+    X.convertTo(X, CV_64F);
+
+    const cv::Matx44d T0(prev.T_cw), T1(cur.T_cw);
+    const cv::Matx33d Kx(K);
+    const cv::Vec3d C0 = cameraCentre(prev.T_cw), C1 = cameraCentre(cur.T_cw);
+    const double maxCosParallax = std::cos(minParallaxDeg * CV_PI / 180.0);
+
+    // In front of the camera and close to the measured pixel
+    auto reprojects = [&](const cv::Matx44d &T, const cv::Vec3d &Xw,
+                          const cv::Point2f &px) {
+      const cv::Vec4d Xc = T * cv::Vec4d(Xw[0], Xw[1], Xw[2], 1.0);
+      if (Xc[2] <= 0)
+        return false;
+      const cv::Vec3d uv = Kx * cv::Vec3d(Xc[0], Xc[1], Xc[2]);
+      return std::hypot(uv[0] / uv[2] - px.x, uv[1] / uv[2] - px.y) <
+             pnpReprojPx;
+    };
+
+    std::vector<cv::Point3f> newPoints;
+    for (int i = 0; i < X.cols; ++i) {
+      const double w = X.at<double>(3, i);
+      if (std::abs(w) < 1e-12)
+        continue;
+      const cv::Vec3d Xw(X.at<double>(0, i) / w, X.at<double>(1, i) / w,
+                         X.at<double>(2, i) / w);
+      if (!reprojects(T0, Xw, p0[i]) || !reprojects(T1, Xw, p1[i]))
         continue;
 
-      depths.push_back(point.z);
-      filtered3dPoints.push_back(point);
+      // Every point is used for tracking: filtering on the (noisy) parallax
+      // keeps mostly points whose depth came out too small, and the scale
+      // then shrinks frame by frame.
+      cur.points[curIdx[i]] = cv::Point3d(Xw);
+
+      // Only well-conditioned points go to the published map; with a small
+      // angle between the two rays the depth is mostly noise.
+      const cv::Vec3d r0 = Xw - C0, r1 = Xw - C1;
+      if (r0.dot(r1) / (cv::norm(r0) * cv::norm(r1)) <= maxCosParallax)
+        newPoints.emplace_back(Xw[0], Xw[1], Xw[2]);
     }
-
-    if (depths.empty()) {
-      throw std::runtime_error("No triangulated points in front of camera");
-    }
-
-    std::nth_element(depths.begin(), depths.begin() + depths.size() / 2,
-                     depths.end());
-    double medianDepth = depths[depths.size() / 2];
-
-    double s = 1.0 / medianDepth;
-
-    // Apply to points AND translation (both, or the map becomes inconsistent)
-    // Points far beyond the median depth are mostly low-parallax noise.
-    const float maxScaledDepth = 10.0f;
-    std::vector<cv::Point3f> scaledPoints;
-    scaledPoints.reserve(filtered3dPoints.size());
-    for (auto &X : filtered3dPoints) {
-      X *= s;
-      if (X.z <= maxScaledDepth)
-        scaledPoints.push_back(X);
-    }
-    cv::Mat t_scaled = t * s;
-
-    return {t_scaled, scaledPoints};
-  };
-
-  std::pair<cv::Mat, std::vector<cv::Point3f>>
-  triangulationAndScaling(cv::Mat projection0, cv::Mat projection1,
-                          std::vector<cv::Point2f> point0,
-                          std::vector<cv::Point2f> point1, cv::Mat t) {
-
-    cv::Mat homogeneousPoints;
-
-    cv::triangulatePoints(projection0, projection1, point0, point1,
-                          homogeneousPoints);
-    // Point3f output requires float input to convertPointsFromHomogeneous
-    homogeneousPoints.convertTo(homogeneousPoints, CV_32F);
-
-    // TODO: Remove points with too low parallax
-
-    std::vector<cv::Point3f> euclideanPoints;
-
-    cv::convertPointsFromHomogeneous(homogeneousPoints.t(), euclideanPoints);
-
-    auto [tScaled, scaled3dPoints] = scaling(t, euclideanPoints);
-
-    // NOTE: consider: Always filter by depth sign, reprojection error, and
-    // parallax afterwards.
-
-    return {tScaled, scaled3dPoints};
-  };
+    return newPoints;
+  }
 
   // Returns the current camera pose and the newly triangulated points, both in
   // the world frame. Throws if the frame could not be tracked; in that case the
-  // previous image and pose are kept so the next frame is matched against it.
-  FrameResult processFrame(cv::Mat imageCurrent) {
+  // previous frame is kept so the next frame is matched against it.
+  FrameResult processFrame(const cv::Mat &imageCurrent) {
+    TrackedFrame cur;
+    std::tie(cur.keypoints, cur.descriptors) = getFeatures(imageCurrent);
+    cur.points.resize(cur.keypoints.size());
+
     if (!initialized) {
-      imagePrev = imageCurrent;
+      cur.T_cw = cv::Mat::eye(4, 4, CV_64F);
+      prev = std::move(cur);
       initialized = true;
-      return {T_cw.inv(), {}};
+      return {prev.T_cw.inv(), {}};
     }
 
-    auto motion = poseEstimation(imagePrev, imageCurrent);
-    if (!motion) {
-      // Hold the pose and keep imagePrev as keyframe, so parallax can build up
+    const auto matches = getBestFeatureMatches(prev.descriptors, cur.descriptors);
+    std::vector<cv::Point2f> p1, p2;
+    for (const auto &m : matches) {
+      p1.push_back(prev.keypoints[m.queryIdx].pt);
+      p2.push_back(cur.keypoints[m.trainIdx].pt);
+    }
+
+    if (isStandingStill(p1, p2)) {
+      // Hold the pose and keep prev as keyframe, so parallax can build up
       nextStepLength.reset();
-      return {T_cw.inv(), {}, true};
+      return {prev.T_cw.inv(), {}, true};
     }
 
-    // R, t: motion from the previous camera to the current one (x2 = R*x1 + t)
-    auto [R, t, point1, point2] = *motion;
+    FrameResult result;
+    if (trackWithPnp(matches, cur)) {
+      result.trackedPoints = static_cast<int>(
+          std::count_if(cur.points.begin(), cur.points.end(),
+                        [](const auto &p) { return p.has_value(); }));
+    } else {
+      // (Re-)initialise from the essential matrix. The first step length sets
+      // the map unit; after a tracking loss the last step length is reused so
+      // the unit stays roughly continuous.
+      auto [R, t] = poseEstimation(p1, p2);
+      double step = scaleInitialized ? lastStepLength : translationScale;
+      if (nextStepLength)
+        step = *nextStepLength;
+      result.scaleReset = scaleInitialized;
+      scaleInitialized = true;
 
-    // Triangulate in the previous camera frame: P0 = K[I|0], P1 = K[R|t]
-    cv::Mat projectionPrev = K * cv::Mat::eye(3, 4, CV_64F);
-    cv::Mat RtCurrent;
-    cv::hconcat(R, t, RtCurrent);
-    cv::Mat projectionCurrent = K * RtCurrent;
-
-    auto [tScaled, scaled3dPoints] = triangulationAndScaling(
-        projectionPrev, projectionCurrent, point1, point2, t);
-
-    tScaled *= translationScale;
-    double pointScale = translationScale;
-    if (nextStepLength) {
-      const double norm = cv::norm(tScaled);
-      if (norm > 1e-9) {
-        const double k = *nextStepLength / norm;
-        tScaled *= k;
-        pointScale *= k;
-      }
-      nextStepLength.reset();
+      cv::Mat T_rel = cv::Mat::eye(4, 4, CV_64F);
+      R.copyTo(T_rel(cv::Rect(0, 0, 3, 3)));
+      cv::Mat(t * step).copyTo(T_rel(cv::Rect(3, 0, 1, 3)));
+      cur.T_cw = T_rel * prev.T_cw;
     }
+    nextStepLength.reset();
 
-    // Chain the relative motion onto the world pose
-    cv::Mat T_rel = cv::Mat::eye(4, 4, CV_64F);
-    R.copyTo(T_rel(cv::Rect(0, 0, 3, 3)));
-    tScaled.copyTo(T_rel(cv::Rect(3, 0, 1, 3)));
+    result.pointsWorld = triangulateNew(matches, cur);
+    result.stepLength =
+        cv::norm(cameraCentre(cur.T_cw) - cameraCentre(prev.T_cw));
+    lastStepLength = result.stepLength;
+    result.T_wc = cur.T_cw.inv();
 
-    cv::Mat T_wc_prev = T_cw.inv();
-    T_cw = T_rel * T_cw;
-
-    // Previous camera frame -> world frame
-    std::vector<cv::Point3f> pointsWorld;
-    pointsWorld.reserve(scaled3dPoints.size());
-    const cv::Matx44d T(T_wc_prev);
-    for (const auto &p : scaled3dPoints) {
-      const double s = pointScale;
-      cv::Vec4d Xw = T * cv::Vec4d(p.x * s, p.y * s, p.z * s, 1.0);
-      pointsWorld.emplace_back(Xw[0], Xw[1], Xw[2]);
-    }
-
-    imagePrev = imageCurrent;
-
-    return {T_cw.inv(), pointsWorld};
+    prev = std::move(cur);
+    return result;
   };
 
   void localMapping(void) {};
   void keyframeSelection(void) {};
 
 private:
-  cv::Mat imagePrev{};
+  TrackedFrame prev{}; // last keyframe
   cv::Mat K{};
-  cv::Mat T_cw{cv::Mat::eye(4, 4, CV_64F)}; // world -> current camera
   double translationScale{1.0};
   std::optional<double> nextStepLength{};
+  double lastStepLength{1.0};
   double standstillFlowPx{1.0};
   double standstillStaticFraction{0.3};
   double keyframeMinParallaxPx{5.0};
+  int minPnpInliers{30};
+  double pnpReprojPx{2.0};
+  double minParallaxDeg{1.0};
   bool initialized{false};
+  bool scaleInitialized{false};
 };
 
 class FrontendNode : public rclcpp::Node {
@@ -410,6 +456,10 @@ public:
         declare_parameter<double>("standstill_flow_px", 1.0),
         declare_parameter<double>("standstill_static_fraction", 0.3),
         declare_parameter<double>("keyframe_min_parallax_px", 5.0));
+    front_.setTrackingThresholds(
+        static_cast<int>(declare_parameter<int64_t>("min_pnp_inliers", 30)),
+        declare_parameter<double>("pnp_reprojection_px", 2.0),
+        declare_parameter<double>("min_parallax_deg", 1.0));
     alignWorldWithRos_ = declare_parameter<bool>("align_world_with_ros", true);
     const auto gtTopic = declare_parameter<std::string>(
         "ground_truth_topic", "/kitti/ground_truth/pose_world");
@@ -509,6 +559,15 @@ private:
       RCLCPP_WARN(get_logger(), "Frame skipped: %s", e.what());
       return;
     }
+
+    if (result.scaleReset)
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                           "Tracking lost, re-initialised scale from last "
+                           "step length");
+    if (!result.standingStill)
+      RCLCPP_DEBUG(get_logger(), "step %.3f, tracked points %d, new points %zu",
+                   result.stepLength, result.trackedPoints,
+                   result.pointsWorld.size());
 
     const auto &stamp = msg->header.stamp;
     publishPose(cv::Matx44d(result.T_wc), stamp);

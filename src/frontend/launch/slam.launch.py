@@ -113,6 +113,21 @@ def generate_launch_description():
                 LaunchConfiguration("max_rotation_deg"),
                 value_type=float,
             ),
+            Parameter(
+                "min_pnp_inliers",
+                LaunchConfiguration("min_pnp_inliers"),
+                value_type=int,
+            ),
+            Parameter(
+                "pnp_reprojection_px",
+                LaunchConfiguration("pnp_reprojection_px"),
+                value_type=float,
+            ),
+            Parameter(
+                "min_parallax_deg",
+                LaunchConfiguration("min_parallax_deg"),
+                value_type=float,
+            ),
         ],
     )
 
@@ -224,8 +239,9 @@ def generate_launch_description():
                 "use_gt_scale",
                 default_value="false",
                 description=(
-                    "Take each step length from KITTI ground truth, so the VO "
-                    "trajectory can be compared to /kitti/ground_truth/path"
+                    "Take the initialisation step length from KITTI ground "
+                    "truth (sets the map unit to metres), so scale drift can "
+                    "be seen against /kitti/ground_truth/path"
                 ),
             ),
             DeclareLaunchArgument(
@@ -252,6 +268,21 @@ def generate_launch_description():
                 "max_rotation_deg",
                 default_value="30.0",
                 description="Reject motion estimates that rotate more than this between keyframes",
+            ),
+            DeclareLaunchArgument(
+                "min_pnp_inliers",
+                default_value="30",
+                description="PnP inliers needed to track against the map (else re-initialise, scale may jump)",
+            ),
+            DeclareLaunchArgument(
+                "pnp_reprojection_px",
+                default_value="2.0",
+                description="Max reprojection error (px) for PnP inliers and new triangulated points",
+            ),
+            DeclareLaunchArgument(
+                "min_parallax_deg",
+                default_value="1.0",
+                description="Min angle between the two rays for a new point to be published to the map (tracking uses all points)",
             ),
             DeclareLaunchArgument(
                 "rviz",
