@@ -30,6 +30,7 @@
 struct FrameResult {
   cv::Mat T_wc; // 4x4 pose of the current camera in the world
   std::vector<cv::Point3f> pointsWorld;
+  bool standingStill{false}; // pose held, keyframe (imagePrev) kept
 };
 
 class FrontendClass {
@@ -41,6 +42,35 @@ public:
   // Force the length of the next frame-to-frame translation (e.g. from ground
   // truth). Used once by the next processFrame call.
   void setNextStepLength(double length) { nextStepLength = length; }
+  void setStandstillThresholds(double flowPx, double staticFraction,
+                               double minParallaxPx) {
+    standstillFlowPx = flowPx;
+    standstillStaticFraction = staticFraction;
+    keyframeMinParallaxPx = minParallaxPx;
+  }
+
+  // With (almost) no baseline the essential matrix is degenerate: RANSAC fits
+  // noise or a moving object and recoverPose returns an arbitrary rotation.
+  // The car counts as standing still if a large share of the matches does not
+  // move at all (static background, even while other cars drive by), or if
+  // the median flow is too small to triangulate from.
+  bool isStandingStill(const std::vector<cv::Point2f> &p1,
+                       const std::vector<cv::Point2f> &p2) const {
+    std::vector<double> flow;
+    flow.reserve(p1.size());
+    std::size_t staticMatches = 0;
+    for (std::size_t i = 0; i < p1.size(); ++i) {
+      flow.push_back(cv::norm(p2[i] - p1[i]));
+      if (flow.back() < standstillFlowPx)
+        ++staticMatches;
+    }
+
+    if (staticMatches >= standstillStaticFraction * flow.size())
+      return true;
+
+    std::nth_element(flow.begin(), flow.begin() + flow.size() / 2, flow.end());
+    return flow[flow.size() / 2] < keyframeMinParallaxPx;
+  }
 
   static std::unordered_map<std::string, cv::Mat>
   loadCalibKitti(const std::string &path) {
@@ -170,8 +200,9 @@ public:
     cv::waitKey(0);
   }
 
-  std::tuple<cv::Mat, cv::Mat, std::vector<cv::Point2f>,
-             std::vector<cv::Point2f>>
+  // Returns std::nullopt if the camera is standing still.
+  std::optional<std::tuple<cv::Mat, cv::Mat, std::vector<cv::Point2f>,
+                           std::vector<cv::Point2f>>>
   poseEstimation(cv::Mat pastImage, cv::Mat currentImage) {
 
     // TODO: past image only need to be ran 1st time.
@@ -180,6 +211,10 @@ public:
 
     auto [point1, point2] =
         getBestFeatureMatches(keypoint1, descriptor1, keypoint2, descriptor2);
+
+    if (isStandingStill(point1, point2))
+      return std::nullopt;
+
     cv::Mat mask;
     cv::Mat E =
         cv::findEssentialMat(point1, point2, K, cv::RANSAC, 0.999, 1.0, mask);
@@ -212,7 +247,7 @@ public:
     t.copyTo(hNew(cv::Rect(3, 0, 1, 3)));
     */
 
-    return {R, t, in1, in2};
+    return std::tuple{R, t, in1, in2};
   };
 
   std::pair<cv::Mat, std::vector<cv::Point3f>>
@@ -290,8 +325,15 @@ public:
       return {T_cw.inv(), {}};
     }
 
+    auto motion = poseEstimation(imagePrev, imageCurrent);
+    if (!motion) {
+      // Hold the pose and keep imagePrev as keyframe, so parallax can build up
+      nextStepLength.reset();
+      return {T_cw.inv(), {}, true};
+    }
+
     // R, t: motion from the previous camera to the current one (x2 = R*x1 + t)
-    auto [R, t, point1, point2] = poseEstimation(imagePrev, imageCurrent);
+    auto [R, t, point1, point2] = *motion;
 
     // Triangulate in the previous camera frame: P0 = K[I|0], P1 = K[R|t]
     cv::Mat projectionPrev = K * cv::Mat::eye(3, 4, CV_64F);
@@ -346,6 +388,9 @@ private:
   cv::Mat T_cw{cv::Mat::eye(4, 4, CV_64F)}; // world -> current camera
   double translationScale{1.0};
   std::optional<double> nextStepLength{};
+  double standstillFlowPx{1.0};
+  double standstillStaticFraction{0.3};
+  double keyframeMinParallaxPx{5.0};
   bool initialized{false};
 };
 
@@ -361,6 +406,10 @@ public:
         declare_parameter<std::string>("camera_frame", "camera_optical_frame");
     front_.setTranslationScale(
         declare_parameter<double>("translation_scale", 1.0));
+    front_.setStandstillThresholds(
+        declare_parameter<double>("standstill_flow_px", 1.0),
+        declare_parameter<double>("standstill_static_fraction", 0.3),
+        declare_parameter<double>("keyframe_min_parallax_px", 5.0));
     alignWorldWithRos_ = declare_parameter<bool>("align_world_with_ros", true);
     const auto gtTopic = declare_parameter<std::string>(
         "ground_truth_topic", "/kitti/ground_truth/pose_world");
@@ -452,7 +501,10 @@ private:
     FrameResult result;
     try {
       result = front_.processFrame(img);
-      prevStampNs_ = stampNs;
+      // While standing still the keyframe is kept, so the GT step length must
+      // still be measured from the keyframe's stamp.
+      if (!result.standingStill)
+        prevStampNs_ = stampNs;
     } catch (const std::exception &e) {
       RCLCPP_WARN(get_logger(), "Frame skipped: %s", e.what());
       return;
